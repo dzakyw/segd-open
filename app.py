@@ -14,19 +14,22 @@ import os
 from io import BytesIO
 
 # ------------------------------------------------------------
-# 1. SEG-D reading functions (same robust fallback as before)
+# 1. SEG-D reading functions (pysegd + robust fallback)
 # ------------------------------------------------------------
 
 def read_segd_pysegd(filepath):
-    """Read with pysegd library."""
+    """Read with pysegd library if available."""
     try:
         from pysegd import Segd
         seg = Segd(filepath)
     except ImportError:
-        from pysegd import segd_read
-        seg = segd_read(filepath)
-    except Exception:
-        raise ImportError("pysegd found but cannot read file")
+        try:
+            from pysegd import segd_read
+            seg = segd_read(filepath)
+        except ImportError:
+            raise ImportError("pysegd not installed")
+    except Exception as e:
+        raise Exception(f"pysegd failed: {e}")
 
     traces = []
     dt = None
@@ -34,77 +37,110 @@ def read_segd_pysegd(filepath):
         traces.append(np.array(trace.data, dtype=np.float32))
         if dt is None:
             try:
-                dt = trace.channel_set.sample_interval * 1e-6
+                dt = trace.channel_set.sample_interval * 1e-6   # µs → s
             except Exception:
                 pass
+
     if not traces:
-        raise ValueError("No traces found.")
+        raise ValueError("No traces found in file.")
     traces = np.vstack([t[np.newaxis, :] for t in traces])
     max_len = max(t.shape[0] for t in traces)
     padded = np.zeros((len(traces), max_len), dtype=np.float32)
     for i, t in enumerate(traces):
-        padded[i, : len(t)] = t
+        padded[i, :len(t)] = t
     return padded, dt
 
+
 def read_segd_fallback(filepath):
-    """Robust hand-rolled SEG-D Rev 0/1 reader."""
+    """
+    Robust hand-rolled SEG-D Rev 0/1 reader.
+    Handles BCD and binary integers, infers parameters from file size.
+    """
     with open(filepath, "rb") as f:
         raw = f.read()
+    file_len = len(raw)
 
+    # BCD helpers
     def bcd2int(byte):
         return (byte >> 4) * 10 + (byte & 0x0F)
+
     def bcd2int16(hi, lo):
         return bcd2int(hi) * 100 + bcd2int(lo)
 
-    # General Header
-    si_bcd_hi = raw[21] if len(raw) > 21 else 0
-    si_bcd_lo = raw[22] if len(raw) > 22 else 0
+    # ---------- General Header (first 32 bytes) ----------
+    # Sample interval (bytes 21-22, BCD in 1/16 ms)
+    si_bcd_hi = raw[21] if file_len > 21 else 0
+    si_bcd_lo = raw[22] if file_len > 22 else 0
     base_si = bcd2int16(si_bcd_hi, si_bcd_lo)
-    dt = base_si / 16.0 / 1000.0 if base_si > 0 else None
+    dt = base_si / 16.0 / 1000.0 if 0 < base_si < 10000 else None
 
-    n_channel_sets = raw[27] if len(raw) > 27 else 1
-    n_ext = bcd2int16(raw[28], raw[29]) if len(raw) > 29 else 0
-    n_exth = bcd2int16(raw[30], raw[31]) if len(raw) > 31 else 0
+    n_channel_sets = raw[27] if file_len > 27 else 1
+    n_ext = bcd2int16(raw[28], raw[29]) if file_len > 29 else 0
+    n_exth = bcd2int16(raw[30], raw[31]) if file_len > 31 else 0
 
-    # Channel Set Header (first set)
+    # ---------- Channel Set Header (first set, bytes 32-63) ----------
     cs_start = 32
-    if len(raw) < cs_start + 32:
-        raise ValueError("File too short for channel-set header")
+    if file_len < cs_start + 32:
+        # No proper header – assume whole file is one trace of floats
+        data = np.frombuffer(raw, dtype=">f4")
+        traces = data.reshape(1, -1)
+        return traces, 0.002   # default dt
+
+    # Number of traces: try BCD first, then binary big-endian
     n_traces_bcd = bcd2int16(raw[cs_start+6], raw[cs_start+7])
     n_traces_bin = int.from_bytes(raw[cs_start+6:cs_start+8], 'big')
     n_traces = n_traces_bcd if 1 <= n_traces_bcd <= 10000 else n_traces_bin
+    if n_traces <= 0 or n_traces > 10000:
+        n_traces = 1
 
+    # Number of samples per trace
     n_samples_bcd = (bcd2int(raw[cs_start+8]) * 100 + bcd2int(raw[cs_start+9])) * 100
     n_samples_bin = int.from_bytes(raw[cs_start+8:cs_start+10], 'big')
     n_samples = n_samples_bcd if 10 <= n_samples_bcd <= 100000 else n_samples_bin
-
-    if n_traces <= 0 or n_traces > 10000:
-        n_traces = 1
     if n_samples <= 0 or n_samples > 50000:
         n_samples = 0
 
+    # ---------- Compute data offset ----------
     header_bytes = 32 + n_channel_sets * 32 + n_ext * 32 + n_exth * 32
     data_offset = header_bytes
 
-    bytes_remaining = len(raw) - data_offset
+    # ---------- Infer n_samples if needed ----------
     if n_samples <= 0 and n_traces > 0:
-        n_samples = bytes_remaining // (n_traces * 4)
-        if n_samples <= 0:
-            raise ValueError("Cannot determine number of samples")
+        bytes_remaining = file_len - data_offset
+        if bytes_remaining <= 0:
+            # Try minimal headers
+            data_offset = 32 + n_channel_sets * 32
+            bytes_remaining = file_len - data_offset
+        if bytes_remaining > 0:
+            n_samples = bytes_remaining // (n_traces * 4)
+            if n_samples <= 0:
+                n_traces = 1
+                n_samples = bytes_remaining // 4
 
+    # ---------- Last resort ----------
+    if n_samples <= 0 or n_traces <= 0:
+        data = np.frombuffer(raw, dtype=">f4")
+        n_samples = len(data)
+        n_traces = 1
+        data_offset = 0
+        st.warning("Could not parse SEG-D header – assuming single trace of raw floats.")
+
+    # ---------- Ensure consistency with file size ----------
     bytes_per_trace = n_samples * 4
-    if data_offset + n_traces * bytes_per_trace > len(raw):
-        max_possible = bytes_remaining // bytes_per_trace
-        if max_possible > 0:
-            st.warning(f"Header says {n_traces} traces, but file contains {max_possible}. Truncating.")
-            n_traces = max_possible
-        else:
-            raise ValueError("Data size inconsistent")
+    max_traces_by_size = (file_len - data_offset) // bytes_per_trace
+    if max_traces_by_size < n_traces:
+        st.warning(f"Header says {n_traces} traces, but file contains {max_traces_by_size}. Truncating.")
+        n_traces = max_traces_by_size
+    if n_traces <= 0:
+        raise ValueError("No complete traces found in file.")
 
+    # ---------- Read traces ----------
     traces = np.zeros((n_traces, n_samples), dtype=np.float32)
     for i in range(n_traces):
         start = data_offset + i * bytes_per_trace
         end = start + bytes_per_trace
+        if end > file_len:
+            break
         chunk = raw[start:end]
         if len(chunk) < bytes_per_trace:
             break
@@ -114,8 +150,9 @@ def read_segd_fallback(filepath):
         dt = 0.002
     return traces, dt
 
+
 def load_segd(filepath, fallback_dt=None):
-    """Try pysegd, fallback to built-in reader."""
+    """Try pysegd first; fall back to robust built-in reader."""
     try:
         import pysegd
         traces, dt = read_segd_pysegd(filepath)
@@ -128,29 +165,27 @@ def load_segd(filepath, fallback_dt=None):
 
 
 # ------------------------------------------------------------
-# 2. Plotting function (adapted for Streamlit)
+# 2. Plotting function (returns matplotlib figure)
 # ------------------------------------------------------------
 
-def plot_seismic_streamlit(traces, dt, clip_pct=98, max_traces=None,
-                           title="Seismic Section", figsize=(12, 8)):
-    """
-    Generate a matplotlib figure with wiggle + heatmap.
-    Returns the figure object.
-    """
+def plot_seismic(traces, dt, clip_pct=98, max_traces=None,
+                 title="Seismic Section", figsize=(12, 8)):
+    """Generate a figure with wiggle traces over a heatmap."""
     if max_traces and traces.shape[0] > max_traces:
         traces = traces[:max_traces]
 
     n_traces, n_samples = traces.shape
-    time_ms = np.arange(n_samples) * dt * 1000.0
+    time_ms = np.arange(n_samples) * dt * 1000.0   # milliseconds
 
     clip = np.percentile(np.abs(traces), clip_pct)
     if clip == 0:
         clip = 1.0
 
+    # Create figure with dark background
     fig, ax = plt.subplots(figsize=figsize, facecolor="#0e1117")
     ax.set_facecolor("#0e1117")
 
-    # Background heatmap
+    # Background: seismic heatmap
     extent = [0.5, n_traces + 0.5, time_ms[-1], time_ms[0]]
     im = ax.imshow(traces.T, aspect="auto", extent=extent,
                    cmap="seismic", vmin=-clip, vmax=clip,
@@ -160,7 +195,7 @@ def plot_seismic_streamlit(traces, dt, clip_pct=98, max_traces=None,
     cbar.ax.yaxis.set_tick_params(color="white")
     plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
 
-    # Wiggle traces
+    # Foreground: wiggle traces
     max_amp = np.max(np.abs(traces))
     if max_amp == 0:
         max_amp = 1.0
@@ -175,6 +210,7 @@ def plot_seismic_streamlit(traces, dt, clip_pct=98, max_traces=None,
         ax.fill_betweenx(time_ms, x_center, x, where=(x >= x_center),
                          color="black", alpha=0.75, linewidth=0, zorder=3)
 
+    # Axes styling
     ax.set_xlim(0.5, n_traces + 0.5)
     ax.set_ylim(time_ms[-1], time_ms[0])
     ax.set_xlabel("Trace Number", color="white", fontsize=12)
@@ -195,24 +231,23 @@ def plot_seismic_streamlit(traces, dt, clip_pct=98, max_traces=None,
 
 
 # ------------------------------------------------------------
-# 3. Streamlit UI
+# 3. Streamlit User Interface
 # ------------------------------------------------------------
 
 st.set_page_config(page_title="SEG-D Seismic Plotter", layout="wide")
 st.title("📈 SEG-D Seismic Plotter")
 st.markdown("Upload a `.sgd` file and interactively adjust the plot.")
 
-# File uploader
 uploaded_file = st.file_uploader("Choose a SEG-D file (.sgd)", type=["sgd", "SGD"])
 
 if uploaded_file is not None:
-    # Save uploaded file to a temporary file (the reader expects a path)
+    # Save uploaded file to a temporary file (reader expects a path)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".sgd") as tmp:
         tmp.write(uploaded_file.getvalue())
         tmp_path = tmp.name
 
     try:
-        # Parameters sidebar
+        # Sidebar controls
         st.sidebar.header("Plot Parameters")
         clip_pct = st.sidebar.slider("Amplitude Clip Percentile", 90, 100, 98, 1)
         max_traces = st.sidebar.number_input("Max Traces to Plot", min_value=1, value=500,
@@ -234,20 +269,18 @@ if uploaded_file is not None:
         st.success(f"Loaded {traces.shape[0]} traces × {traces.shape[1]} samples")
         st.info(f"Sample interval: {dt*1000:.3f} ms  |  Record length: {traces.shape[1]*dt*1000:.1f} ms")
 
-        # Generate plot
-        fig = plot_seismic_streamlit(traces, dt, clip_pct=clip_pct,
-                                     max_traces=max_traces if max_traces != 0 else None,
-                                     title=os.path.basename(uploaded_file.name),
-                                     figsize=(12, 8))
-
-        # Display
+        # Generate and display plot
+        fig = plot_seismic(traces, dt, clip_pct=clip_pct,
+                           max_traces=max_traces if max_traces != 0 else None,
+                           title=os.path.basename(uploaded_file.name),
+                           figsize=(12, 8))
         st.pyplot(fig)
 
-        # Optional: download button
+        # Download button
         buf = BytesIO()
         fig.savefig(buf, format="png", dpi=150, bbox_inches="tight")
         buf.seek(0)
-        st.download_button("Download plot as PNG", data=buf, file_name="seismic_plot.png",
+        st.download_button("📥 Download plot as PNG", data=buf, file_name="seismic_plot.png",
                            mime="image/png")
 
     except Exception as e:
@@ -255,15 +288,16 @@ if uploaded_file is not None:
         st.exception(e)
 
     finally:
-        # Clean up temp file
+        # Clean up temporary file
         os.unlink(tmp_path)
+
 else:
-    st.info("Please upload a SEG-D (.sgd) file to begin.")
+    st.info("👈 Please upload a SEG-D (.sgd) file to begin.")
     st.markdown("""
     **Example usage:**  
     - Upload a file (e.g., `001001.sgd`)  
     - Adjust clip percentile and max traces in the sidebar  
     - Optionally override the sample interval if header is missing  
-    - View the seismic section with wiggle + colour overlay  
+    - View the seismic section with wiggle traces over a colour heatmap  
     - Download the plot as PNG
     """)
