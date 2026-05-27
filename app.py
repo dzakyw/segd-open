@@ -28,7 +28,6 @@ def read_with_pysegd3(filepath):
         for trace_header, trace_data in read_segd_rev3(filepath):
             traces_list.append(np.array(trace_data, dtype=np.float32))
             if dt is None:
-                # Try to get sample interval from header (if available)
                 try:
                     dt = trace_header.sample_interval * 1e-6
                 except:
@@ -47,11 +46,11 @@ def read_with_obspy(filepath):
     """Attempt to read using ObsPy's SEG-D module (requires read_segd plugin)."""
     try:
         from obspy import read
-        # ObsPy's native SEG-D support is limited; try to force format
-        st = read(filepath, format="SEGD")
-        if len(st) > 0:
-            traces = np.vstack([tr.data for tr in st])
-            dt = st[0].stats.delta if st[0].stats.delta else 0.002
+        # Use a different variable name to avoid conflict with streamlit 'st'
+        stream = read(filepath, format="SEGD")
+        if len(stream) > 0:
+            traces = np.vstack([tr.data for tr in stream])
+            dt = stream[0].stats.delta if stream[0].stats.delta else 0.002
             return traces, dt
     except Exception as e:
         st.info(f"ObsPy SEG-D read failed: {e}")
@@ -116,7 +115,7 @@ def load_segd(filepath, fallback_dt=None, manual_params=None):
 
 
 # ------------------------------------------------------------
-# 2. Plotting function (unchanged from previous version)
+# 2. Plotting function
 # ------------------------------------------------------------
 
 def plot_seismic(traces, dt, clip_pct=98, max_traces=None,
