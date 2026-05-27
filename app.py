@@ -1,8 +1,10 @@
 """
-SEG-D Seismic Plotter - Streamlit App with Manual Override
-===========================================================
-Upload a SEG-D (.sgd) file. If automatic header parsing fails, 
-you can manually specify trace layout.
+SEG-D Seismic Plotter – Streamlit App
+=======================================
+Supports multiple backends:
+- pysegd3 (Rev 3 files)
+- ObsPy (Rev 2 / 3 via read_segd)
+- Manual override (any file with user-provided parameters)
 """
 
 import streamlit as st
@@ -14,180 +16,111 @@ import os
 from io import BytesIO
 
 # ------------------------------------------------------------
-# 1. SEG-D reading functions (pysegd + fallback + manual)
+# 1. SEG-D readers (multiple backends)
 # ------------------------------------------------------------
 
-def read_segd_pysegd(filepath):
-    """Read with pysegd library if available."""
+def read_with_pysegd3(filepath):
+    """Attempt to read using pysegd3 library."""
     try:
-        from pysegd import Segd
-        seg = Segd(filepath)
-    except ImportError:
-        try:
-            from pysegd import segd_read
-            seg = segd_read(filepath)
-        except ImportError:
-            raise ImportError("pysegd not installed")
+        from pysegd3.readsegd3 import read_segd_rev3
+        traces_list = []
+        dt = None
+        for trace_header, trace_data in read_segd_rev3(filepath):
+            traces_list.append(np.array(trace_data, dtype=np.float32))
+            if dt is None:
+                # Try to get sample interval from header (if available)
+                try:
+                    dt = trace_header.sample_interval * 1e-6
+                except:
+                    pass
+        if traces_list:
+            traces = np.vstack(traces_list)
+            if dt is None or dt <= 0:
+                dt = 0.002
+            return traces, dt
     except Exception as e:
-        raise Exception(f"pysegd failed: {e}")
-
-    traces = []
-    dt = None
-    for trace in seg.traces:
-        traces.append(np.array(trace.data, dtype=np.float32))
-        if dt is None:
-            try:
-                dt = trace.channel_set.sample_interval * 1e-6
-            except Exception:
-                pass
-    if not traces:
-        raise ValueError("No traces found.")
-    traces = np.vstack([t[np.newaxis, :] for t in traces])
-    max_len = max(t.shape[0] for t in traces)
-    padded = np.zeros((len(traces), max_len), dtype=np.float32)
-    for i, t in enumerate(traces):
-        padded[i, :len(t)] = t
-    return padded, dt
+        st.info(f"pysegd3 failed: {e}")
+    return None, None
 
 
-def read_segd_manual(filepath, n_traces, n_samples, data_offset, byte_order='big', dt=0.002):
-    """
-    Read raw 32-bit floats from file.
-    byte_order: 'big' (most SEG-D) or 'little'
-    """
+def read_with_obspy(filepath):
+    """Attempt to read using ObsPy's SEG-D module (requires read_segd plugin)."""
+    try:
+        from obspy import read
+        # ObsPy's native SEG-D support is limited; try to force format
+        st = read(filepath, format="SEGD")
+        if len(st) > 0:
+            traces = np.vstack([tr.data for tr in st])
+            dt = st[0].stats.delta if st[0].stats.delta else 0.002
+            return traces, dt
+    except Exception as e:
+        st.info(f"ObsPy SEG-D read failed: {e}")
+    return None, None
+
+
+def read_manual(filepath, n_traces, n_samples, data_offset, byte_order='big', dt=0.002):
+    """Read raw 32-bit floats with user-provided layout."""
     with open(filepath, "rb") as f:
         raw = f.read()
     file_len = len(raw)
     bytes_per_trace = n_samples * 4
     expected_size = data_offset + n_traces * bytes_per_trace
     if expected_size > file_len:
-        st.warning(f"File too short: need {expected_size} bytes, have {file_len}. Truncating traces.")
         max_possible = (file_len - data_offset) // bytes_per_trace
         if max_possible <= 0:
-            raise ValueError("Data offset or sample count too large.")
+            raise ValueError("Offset or sample count too large for file.")
+        st.warning(f"Truncating traces from {n_traces} to {max_possible}")
         n_traces = max_possible
-    traces = np.zeros((n_traces, n_samples), dtype=np.float32)
     dtype = '>f4' if byte_order == 'big' else '<f4'
+    traces = np.zeros((n_traces, n_samples), dtype=np.float32)
     for i in range(n_traces):
         start = data_offset + i * bytes_per_trace
         end = start + bytes_per_trace
         if end > file_len:
             break
-        chunk = raw[start:end]
-        if len(chunk) < bytes_per_trace:
-            break
-        traces[i] = np.frombuffer(chunk, dtype=dtype)
+        traces[i] = np.frombuffer(raw[start:end], dtype=dtype)
     return traces, dt
 
 
-def auto_detect_or_manual(filepath, fallback_dt=None):
+def load_segd(filepath, fallback_dt=None, manual_params=None):
     """
-    Try pysegd, then automatic fallback. If fallback fails, return None and
-    provide instructions for manual override.
+    Try backends in order: pysegd3, ObsPy, then manual.
+    manual_params = dict with keys: n_traces, n_samples, data_offset, byte_order, dt
     """
-    # First try pysegd
-    try:
-        import pysegd
-        return read_segd_pysegd(filepath)
-    except Exception as e:
-        st.info(f"pysegd not available or failed: {e}. Trying built‑in auto‑detect...")
-    
-    # Automatic fallback (simplified, no crash)
-    try:
-        traces, dt = auto_read_segd(filepath)
-        if traces is not None:
-            if dt is None or dt <= 0:
-                dt = fallback_dt or 0.002
+    # 1. pysegd3
+    traces, dt = read_with_pysegd3(filepath)
+    if traces is not None:
+        st.success("✅ Loaded using pysegd3")
+        return traces, dt
+
+    # 2. ObsPy
+    traces, dt = read_with_obspy(filepath)
+    if traces is not None:
+        st.success("✅ Loaded using ObsPy")
+        return traces, dt
+
+    # 3. Manual (if parameters supplied)
+    if manual_params:
+        try:
+            traces, dt = read_manual(filepath,
+                                     manual_params['n_traces'],
+                                     manual_params['n_samples'],
+                                     manual_params['data_offset'],
+                                     manual_params.get('byte_order', 'big'),
+                                     manual_params.get('dt', fallback_dt or 0.002))
+            st.success("✅ Loaded using manual parameters")
             return traces, dt
-    except Exception as e:
-        st.warning(f"Auto‑detect failed: {e}")
-    
+        except Exception as e:
+            st.error(f"Manual load failed: {e}")
     return None, None
 
 
-def auto_read_segd(filepath):
-    """
-    A safer auto-detection that returns (None, None) instead of crashing.
-    It tries common header layouts.
-    """
-    with open(filepath, "rb") as f:
-        raw = f.read()
-    file_len = len(raw)
-
-    # Helper: BCD to int
-    def bcd2int(b):
-        return ((b >> 4) & 0x0F) * 10 + (b & 0x0F)
-
-    def bcd2int16(hi, lo):
-        return bcd2int(hi) * 100 + bcd2int(lo)
-
-    # Try general header (32 bytes)
-    if file_len < 32:
-        return None, None
-
-    # Sample interval from bytes 21-22 (BCD, units of 1/16 ms)
-    base_si = bcd2int16(raw[21], raw[22]) if file_len > 22 else 0
-    dt = base_si / 16.0 / 1000.0 if 0 < base_si < 10000 else None
-
-    # Channel set header (32 bytes after general header)
-    cs_start = 32
-    if file_len < cs_start + 32:
-        return None, None
-
-    # Try to read n_traces and n_samples (as BCD or binary)
-    n_traces_bcd = bcd2int16(raw[cs_start+6], raw[cs_start+7])
-    n_traces_bin = int.from_bytes(raw[cs_start+6:cs_start+8], 'big')
-    n_traces = n_traces_bcd if 1 <= n_traces_bcd <= 10000 else n_traces_bin
-    if not (1 <= n_traces <= 10000):
-        n_traces = 1
-
-    n_samples_bcd = (bcd2int(raw[cs_start+8]) * 100 + bcd2int(raw[cs_start+9])) * 100
-    n_samples_bin = int.from_bytes(raw[cs_start+8:cs_start+10], 'big')
-    n_samples = n_samples_bcd if 10 <= n_samples_bcd <= 100000 else n_samples_bin
-    if not (10 <= n_samples <= 50000):
-        n_samples = 0
-
-    # Compute offset: assume no extended headers for simplicity
-    data_offset = 32 + 32  # general + one channel set
-
-    # If n_samples still unknown, infer from file size
-    if n_samples <= 0 and n_traces > 0:
-        bytes_remaining = file_len - data_offset
-        if bytes_remaining > 0:
-            n_samples = bytes_remaining // (n_traces * 4)
-            if n_samples <= 0:
-                n_samples = bytes_remaining // 4  # assume one trace
-                n_traces = 1
-        else:
-            return None, None
-
-    bytes_per_trace = n_samples * 4
-    max_traces = (file_len - data_offset) // bytes_per_trace
-    if max_traces <= 0:
-        return None, None
-    if n_traces > max_traces:
-        n_traces = max_traces
-
-    # Read traces
-    traces = np.zeros((n_traces, n_samples), dtype=np.float32)
-    for i in range(n_traces):
-        start = data_offset + i * bytes_per_trace
-        end = start + bytes_per_trace
-        if end > file_len:
-            break
-        traces[i] = np.frombuffer(raw[start:end], dtype=">f4")
-    if dt is None or dt <= 0:
-        dt = 0.002
-    return traces, dt
-
-
 # ------------------------------------------------------------
-# 2. Plotting function (unchanged)
+# 2. Plotting function (unchanged from previous version)
 # ------------------------------------------------------------
 
 def plot_seismic(traces, dt, clip_pct=98, max_traces=None,
                  title="Seismic Section", figsize=(12, 8)):
-    """Generate a figure with wiggle traces over a heatmap."""
     if max_traces and traces.shape[0] > max_traces:
         traces = traces[:max_traces]
 
@@ -244,12 +177,12 @@ def plot_seismic(traces, dt, clip_pct=98, max_traces=None,
 
 
 # ------------------------------------------------------------
-# 3. Streamlit UI with Manual Override
+# 3. Streamlit UI with manual override
 # ------------------------------------------------------------
 
 st.set_page_config(page_title="SEG-D Seismic Plotter", layout="wide")
 st.title("📈 SEG-D Seismic Plotter")
-st.markdown("Upload a `.sgd` file – automatic header parsing; if it fails, you can manually specify the data layout.")
+st.markdown("Upload a `.sgd` file – the app will try multiple reading backends. If all fail, you can specify the data layout manually.")
 
 uploaded_file = st.file_uploader("Choose a SEG-D file (.sgd)", type=["sgd", "SGD"])
 
@@ -258,56 +191,46 @@ if uploaded_file is not None:
         tmp.write(uploaded_file.getvalue())
         tmp_path = tmp.name
 
-    # Try automatic detection first
-    traces, dt = auto_detect_or_manual(tmp_path)
-
-    if traces is not None:
-        # Automatic succeeded – show sidebar with normal options
-        st.success("✅ Automatic header parsing succeeded!")
-        with st.expander("Show file info"):
-            st.write(f"Traces: {traces.shape[0]}, Samples per trace: {traces.shape[1]}")
-            st.write(f"Detected dt: {dt*1000:.3f} ms")
-        use_manual = False
-    else:
-        st.error("❌ Automatic header parsing failed.")
-        st.info("Please use the manual parameters below to read your file.")
-        use_manual = True
-
-    # Sidebar controls (common)
+    # Sidebar controls
     st.sidebar.header("Plot Parameters")
     clip_pct = st.sidebar.slider("Amplitude Clip Percentile", 90, 100, 98, 1)
     max_traces = st.sidebar.number_input("Max Traces to Plot", min_value=1, value=500, step=50)
     if max_traces <= 0:
         max_traces = None
 
-    if not use_manual:
-        # Automatic mode – allow dt override
+    # Automatic loading with backends
+    traces, dt = load_segd(tmp_path, fallback_dt=0.002)
+
+    if traces is not None:
+        # Success – allow dt override
         dt_override = st.sidebar.number_input("Override dt (seconds) – 0 to keep detected",
                                               value=0.0, step=0.0005, format="%.4f")
         if dt_override > 0:
             dt = dt_override
+        st.success(f"Loaded {traces.shape[0]} traces × {traces.shape[1]} samples")
+        st.info(f"Sample interval: {dt*1000:.3f} ms | Record length: {traces.shape[1]*dt*1000:.1f} ms")
     else:
-        # Manual mode – ask for parameters
-        st.sidebar.header("Manual Data Layout (required)")
-        n_traces_manual = st.sidebar.number_input("Number of traces", min_value=1, value=100, step=10)
-        n_samples_manual = st.sidebar.number_input("Samples per trace", min_value=1, value=500, step=50)
-        data_offset_manual = st.sidebar.number_input("Data offset (bytes)", min_value=0, value=64, step=8,
-                                                     help="Bytes to skip before data (e.g., 64 for SEG-D without extended headers)")
-        byte_order = st.sidebar.selectbox("Byte order", ["big", "little"], index=0,
-                                          help="Most SEG-D files are big-endian")
-        dt_manual = st.sidebar.number_input("Sample interval (seconds)", min_value=0.0001, value=0.002, step=0.0005, format="%.4f")
+        st.error("❌ All automatic readers failed.")
+        st.info("Please provide manual layout parameters below.")
+        st.sidebar.header("Manual Data Layout")
+        with st.sidebar.form("manual_form"):
+            n_traces_manual = st.number_input("Number of traces", min_value=1, value=100, step=10)
+            n_samples_manual = st.number_input("Samples per trace", min_value=1, value=500, step=50)
+            data_offset_manual = st.number_input("Data offset (bytes)", min_value=0, value=64, step=8)
+            byte_order = st.selectbox("Byte order", ["big", "little"], index=0)
+            dt_manual = st.number_input("Sample interval (seconds)", min_value=0.0001, value=0.002, step=0.0005, format="%.4f")
+            submitted = st.form_submit_button("Load with manual parameters")
+        if submitted:
+            manual_params = {
+                'n_traces': n_traces_manual,
+                'n_samples': n_samples_manual,
+                'data_offset': data_offset_manual,
+                'byte_order': byte_order,
+                'dt': dt_manual
+            }
+            traces, dt = load_segd(tmp_path, fallback_dt=dt_manual, manual_params=manual_params)
 
-        if st.sidebar.button("Load with these parameters"):
-            try:
-                traces, dt = read_segd_manual(tmp_path, n_traces_manual, n_samples_manual,
-                                              data_offset_manual, byte_order, dt_manual)
-                st.success(f"Loaded {traces.shape[0]} traces × {traces.shape[1]} samples")
-                use_manual = False  # now we have data
-            except Exception as e:
-                st.error(f"Failed to load: {e}")
-                traces = None
-
-    # Plot if we have traces
+    # Plot if we have data
     if traces is not None:
         fig = plot_seismic(traces, dt, clip_pct=clip_pct,
                            max_traces=max_traces if max_traces != 0 else None,
@@ -321,21 +244,21 @@ if uploaded_file is not None:
         st.download_button("📥 Download plot as PNG", data=buf, file_name="seismic_plot.png",
                            mime="image/png")
     else:
-        if use_manual:
-            st.warning("Please adjust manual parameters and click 'Load with these parameters'.")
-        else:
-            st.warning("Could not load file automatically. Try manual mode.")
+        st.warning("No data loaded. Please check manual parameters or install additional readers.")
 
     os.unlink(tmp_path)
 
 else:
     st.info("👈 Upload a SEG-D (.sgd) file to start.")
     st.markdown("""
-    **Troubleshooting:**  
-    If automatic detection fails, use **manual mode** (appears automatically).  
-    Common values to try:
-    - **Data offset**: 64 bytes (general header 32 + channel set header 32)  
-    - **Byte order**: big-endian  
-    - **Samples per trace**: try 500, 1000, 2000, or compute from file size: `(file_size - offset) / (4 * traces)`  
-    - **Number of traces**: 1, 100, 200, or compute from file size
+    **Supported backends (in order):**
+    - **pysegd3** (install with `pip install pysegd3`) – best for Rev 3 files
+    - **ObsPy** (install with `pip install obspy`) – may require additional plugin `read_segd`
+    - **Manual override** – works for any file if you know the layout
+
+    **For your specific file (`001001.sgd`):**  
+    If automatic fails, try manual with:
+    - Data offset = 64 (typical)
+    - Byte order = big-endian
+    - Experiment with traces and samples until the plot looks like seismic data.
     """)
