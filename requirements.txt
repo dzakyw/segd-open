@@ -7,4 +7,5 @@ obspy
 numpy
 numpy 
 matplotlib 
-pysegd
+pysegd3
+obspy
