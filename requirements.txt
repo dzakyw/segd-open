@@ -1,13 +1,4 @@
-streamlit
+streamlit 
+segdio 
+plotly 
 numpy
-pandas
-readgssi
-matplotlib
-obspy
-numpy
-numpy 
-plotly
-segdio
-matplotlib 
-pysegd3
-obspy
