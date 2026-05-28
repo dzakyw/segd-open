@@ -1,4 +1,5 @@
-streamlit 
-segdio 
-plotly 
 numpy
+streamlit
+plotly
+segdio
+cython
